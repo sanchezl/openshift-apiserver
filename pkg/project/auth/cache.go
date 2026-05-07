@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -173,6 +174,14 @@ func (l syncedClusterRoleBindingLister) LastSyncResourceVersion() string {
 	return l.versioner.LastSyncResourceVersion()
 }
 
+// authorizationCacheStores groups the three cache stores so they can be
+// swapped atomically during full cache invalidation.
+type authorizationCacheStores struct {
+	reviewRecordStore       cache.Store
+	userSubjectRecordStore  cache.Store
+	groupSubjectRecordStore cache.Store
+}
+
 // AuthorizationCache maintains a cache on the set of namespaces a user or group can access.
 type AuthorizationCache struct {
 	// allKnownNamespaces we track all the known namespaces, so we can detect deletes.
@@ -187,9 +196,7 @@ type AuthorizationCache struct {
 	roleBindingNamespacer         SyncedRoleBindingLister
 	roleLastSyncResourceVersioner LastSyncResourceVersioner
 
-	reviewRecordStore       cache.Store
-	userSubjectRecordStore  cache.Store
-	groupSubjectRecordStore cache.Store
+	stores atomic.Pointer[authorizationCacheStores]
 
 	clusterBindingResourceVersions sets.String
 	clusterRoleResourceVersions    sets.String
@@ -255,10 +262,6 @@ func NewAuthorizationCache(
 		roleBindingNamespacer:         srbLister,
 		roleLastSyncResourceVersioner: unionLastSyncResourceVersioner{scrLister, scrbLister, srLister, srbLister},
 
-		reviewRecordStore:       cache.NewStore(reviewRecordKeyFn),
-		userSubjectRecordStore:  cache.NewStore(subjectRecordKeyFn),
-		groupSubjectRecordStore: cache.NewStore(subjectRecordKeyFn),
-
 		reviewer: reviewer,
 		skip:     &neverSkipSynchronizer{},
 
@@ -268,6 +271,11 @@ func NewAuthorizationCache(
 		lastCacheInvalidation: realClock.Now(),
 		maxCacheLifespan:      defaultMaxCacheLifespan,
 	}
+	ac.stores.Store(&authorizationCacheStores{
+		reviewRecordStore:       cache.NewStore(reviewRecordKeyFn),
+		userSubjectRecordStore:  cache.NewStore(subjectRecordKeyFn),
+		groupSubjectRecordStore: cache.NewStore(subjectRecordKeyFn),
+	})
 	ac.lastSyncResourceVersioner = namespaceLastSyncResourceVersioner
 	ac.syncHandler = ac.syncRequest
 	return ac
@@ -424,7 +432,7 @@ func (ac *AuthorizationCache) invalidateCache(expired bool) bool {
 	return invalidateCache
 }
 
-// synchronize runs a a full synchronization over the cache data.  it must be run in a single-writer model, it's not thread-safe by design.
+// synchronize runs a full synchronization over the cache data. It must be run in a single-writer model, it's not thread-safe by design.
 func (ac *AuthorizationCache) synchronize() {
 	expired := ac.cacheHasExpired()
 	// if none of our internal reflectors changed, then we can skip reviewing the cache
@@ -434,9 +442,10 @@ func (ac *AuthorizationCache) synchronize() {
 	}
 
 	// by default, we update our current caches and do an incremental change
-	userSubjectRecordStore := ac.userSubjectRecordStore
-	groupSubjectRecordStore := ac.groupSubjectRecordStore
-	reviewRecordStore := ac.reviewRecordStore
+	currentStores := ac.stores.Load()
+	userSubjectRecordStore := currentStores.userSubjectRecordStore
+	groupSubjectRecordStore := currentStores.groupSubjectRecordStore
+	reviewRecordStore := currentStores.reviewRecordStore
 
 	// if there was a global change that forced complete invalidation, we rebuild our cache and do a fast swap at end
 	invalidateCache := ac.invalidateCache(expired)
@@ -453,11 +462,13 @@ func (ac *AuthorizationCache) synchronize() {
 	ac.synchronizeRoleBindings(userSubjectRecordStore, groupSubjectRecordStore, reviewRecordStore)
 	ac.purgeDeletedNamespaces(ac.allKnownNamespaces, newKnownNamespaces, userSubjectRecordStore, groupSubjectRecordStore, reviewRecordStore)
 
-	// if we did a full rebuild, now we swap the fully rebuilt cache
+	// if we did a full rebuild, now we swap the fully rebuilt cache atomically
 	if invalidateCache {
-		ac.userSubjectRecordStore = userSubjectRecordStore
-		ac.groupSubjectRecordStore = groupSubjectRecordStore
-		ac.reviewRecordStore = reviewRecordStore
+		ac.stores.Store(&authorizationCacheStores{
+			userSubjectRecordStore:  userSubjectRecordStore,
+			groupSubjectRecordStore: groupSubjectRecordStore,
+			reviewRecordStore:       reviewRecordStore,
+		})
 	}
 	ac.allKnownNamespaces = newKnownNamespaces
 
@@ -511,14 +522,17 @@ func (ac *AuthorizationCache) List(userInfo user.Info, selector labels.Selector)
 	user := userInfo.GetName()
 	groups := userInfo.GetGroups()
 
-	obj, exists, _ := ac.userSubjectRecordStore.GetByKey(user)
+	// snapshot the stores pointer once so we read from a consistent pair
+	stores := ac.stores.Load()
+
+	obj, exists, _ := stores.userSubjectRecordStore.GetByKey(user)
 	if exists {
 		subjectRecord := obj.(*subjectRecord)
 		keys.Insert(subjectRecord.namespaces.List()...)
 	}
 
 	for _, group := range groups {
-		obj, exists, _ := ac.groupSubjectRecordStore.GetByKey(group)
+		obj, exists, _ := stores.groupSubjectRecordStore.GetByKey(group)
 		if exists {
 			subjectRecord := obj.(*subjectRecord)
 			keys.Insert(subjectRecord.namespaces.List()...)
