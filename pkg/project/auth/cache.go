@@ -600,10 +600,13 @@ func deleteNamespaceFromSubjects(subjectRecordStore cache.Store, subjects []stri
 	for _, subject := range subjects {
 		obj, exists, _ := subjectRecordStore.GetByKey(subject)
 		if exists {
-			subjectRecord := obj.(*subjectRecord)
-			delete(subjectRecord.namespaces, namespace)
-			if len(subjectRecord.namespaces) == 0 {
-				subjectRecordStore.Delete(subjectRecord)
+			old := obj.(*subjectRecord)
+			newNamespaces := sets.NewString(old.namespaces.UnsortedList()...)
+			newNamespaces.Delete(namespace)
+			if len(newNamespaces) == 0 {
+				subjectRecordStore.Delete(old)
+			} else {
+				subjectRecordStore.Update(&subjectRecord{subject: subject, namespaces: newNamespaces})
 			}
 		}
 	}
@@ -612,15 +615,15 @@ func deleteNamespaceFromSubjects(subjectRecordStore cache.Store, subjects []stri
 // addSubjectsToNamespace adds the specified namespace to each subject
 func addSubjectsToNamespace(subjectRecordStore cache.Store, subjects []string, namespace string) {
 	for _, subject := range subjects {
-		var item *subjectRecord
 		obj, exists, _ := subjectRecordStore.GetByKey(subject)
 		if exists {
-			item = obj.(*subjectRecord)
+			old := obj.(*subjectRecord)
+			newNamespaces := sets.NewString(old.namespaces.UnsortedList()...)
+			newNamespaces.Insert(namespace)
+			subjectRecordStore.Update(&subjectRecord{subject: subject, namespaces: newNamespaces})
 		} else {
-			item = &subjectRecord{subject: subject, namespaces: sets.NewString()}
-			subjectRecordStore.Add(item)
+			subjectRecordStore.Add(&subjectRecord{subject: subject, namespaces: sets.NewString(namespace)})
 		}
-		item.namespaces.Insert(namespace)
 	}
 }
 
