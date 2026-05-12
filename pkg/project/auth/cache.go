@@ -211,6 +211,12 @@ type AuthorizationCache struct {
 	watchers    []CacheWatcher
 	watcherLock sync.Mutex
 
+	// namespaceMu protects subjectRecord.namespaces map mutations and reads.
+	// It is held for nanoseconds per individual Insert/Delete/List operation,
+	// NOT for the entire synchronize() call. This prevents concurrent map
+	// read/write panics between List() (reader) and synchronize() (writer).
+	namespaceMu sync.RWMutex
+
 	// lastCacheInvalidation, maxCacheLifespan and clock exist so we can
 	// control the maximum time between cache invalidations. This is a
 	// temporary workaround due to release timing risk. Cache expires when
@@ -386,8 +392,8 @@ func (ac *AuthorizationCache) purgeDeletedNamespaces(oldNamespaces, newNamespace
 	for i := range reviewRecordItems {
 		reviewRecord := reviewRecordItems[i].(*reviewRecord)
 		if !newNamespaces.Has(reviewRecord.namespace) {
-			deleteNamespaceFromSubjects(userSubjectRecordStore, reviewRecord.users, reviewRecord.namespace)
-			deleteNamespaceFromSubjects(groupSubjectRecordStore, reviewRecord.groups, reviewRecord.namespace)
+			ac.deleteNamespaceFromSubjects(userSubjectRecordStore, reviewRecord.users, reviewRecord.namespace)
+			ac.deleteNamespaceFromSubjects(groupSubjectRecordStore, reviewRecord.groups, reviewRecord.namespace)
 			reviewRecordStore.Delete(reviewRecord)
 		}
 	}
@@ -503,10 +509,10 @@ func (ac *AuthorizationCache) syncRequest(request *reviewRequest, userSubjectRec
 		groupsToRemove.Delete(review.Groups()...)
 	}
 
-	deleteNamespaceFromSubjects(userSubjectRecordStore, usersToRemove.List(), namespace)
-	deleteNamespaceFromSubjects(groupSubjectRecordStore, groupsToRemove.List(), namespace)
-	addSubjectsToNamespace(userSubjectRecordStore, review.Users(), namespace)
-	addSubjectsToNamespace(groupSubjectRecordStore, review.Groups(), namespace)
+	ac.deleteNamespaceFromSubjects(userSubjectRecordStore, usersToRemove.List(), namespace)
+	ac.deleteNamespaceFromSubjects(groupSubjectRecordStore, groupsToRemove.List(), namespace)
+	ac.addSubjectsToNamespace(userSubjectRecordStore, review.Users(), namespace)
+	ac.addSubjectsToNamespace(groupSubjectRecordStore, review.Groups(), namespace)
 	cacheReviewRecord(request, lastKnownValue, review, reviewRecordStore)
 	ac.notifyWatchers(namespace, lastKnownValue, sets.NewString(review.Users()...), sets.NewString(review.Groups()...))
 
@@ -525,6 +531,7 @@ func (ac *AuthorizationCache) List(userInfo user.Info, selector labels.Selector)
 	// snapshot the stores pointer once so we read from a consistent pair
 	stores := ac.stores.Load()
 
+	ac.namespaceMu.RLock()
 	obj, exists, _ := stores.userSubjectRecordStore.GetByKey(user)
 	if exists {
 		subjectRecord := obj.(*subjectRecord)
@@ -538,6 +545,7 @@ func (ac *AuthorizationCache) List(userInfo user.Info, selector labels.Selector)
 			keys.Insert(subjectRecord.namespaces.List()...)
 		}
 	}
+	ac.namespaceMu.RUnlock()
 
 	allowedNamespaces, err := scope.ScopesToVisibleNamespaces(userInfo.GetExtra()[authorizationapi.ScopesKey], ac.clusterRoleLister, true)
 	if err != nil {
@@ -610,34 +618,36 @@ func skipReview(request *reviewRequest, lastKnownValue *reviewRecord) bool {
 
 // deleteNamespaceFromSubjects removes the namespace from each subject
 // if no other namespaces are active to that subject, it will also delete the subject from the cache entirely
-func deleteNamespaceFromSubjects(subjectRecordStore cache.Store, subjects []string, namespace string) {
+func (ac *AuthorizationCache) deleteNamespaceFromSubjects(subjectRecordStore cache.Store, subjects []string, namespace string) {
 	for _, subject := range subjects {
 		obj, exists, _ := subjectRecordStore.GetByKey(subject)
 		if exists {
-			old := obj.(*subjectRecord)
-			newNamespaces := sets.NewString(old.namespaces.UnsortedList()...)
-			newNamespaces.Delete(namespace)
-			if len(newNamespaces) == 0 {
-				subjectRecordStore.Delete(old)
-			} else {
-				subjectRecordStore.Update(&subjectRecord{subject: subject, namespaces: newNamespaces})
+			subjectRecord := obj.(*subjectRecord)
+			ac.namespaceMu.Lock()
+			delete(subjectRecord.namespaces, namespace)
+			isEmpty := len(subjectRecord.namespaces) == 0
+			ac.namespaceMu.Unlock()
+			if isEmpty {
+				subjectRecordStore.Delete(subjectRecord)
 			}
 		}
 	}
 }
 
 // addSubjectsToNamespace adds the specified namespace to each subject
-func addSubjectsToNamespace(subjectRecordStore cache.Store, subjects []string, namespace string) {
+func (ac *AuthorizationCache) addSubjectsToNamespace(subjectRecordStore cache.Store, subjects []string, namespace string) {
 	for _, subject := range subjects {
+		var item *subjectRecord
 		obj, exists, _ := subjectRecordStore.GetByKey(subject)
 		if exists {
-			old := obj.(*subjectRecord)
-			newNamespaces := sets.NewString(old.namespaces.UnsortedList()...)
-			newNamespaces.Insert(namespace)
-			subjectRecordStore.Update(&subjectRecord{subject: subject, namespaces: newNamespaces})
+			item = obj.(*subjectRecord)
 		} else {
-			subjectRecordStore.Add(&subjectRecord{subject: subject, namespaces: sets.NewString(namespace)})
+			item = &subjectRecord{subject: subject, namespaces: sets.NewString()}
+			subjectRecordStore.Add(item)
 		}
+		ac.namespaceMu.Lock()
+		item.namespaces.Insert(namespace)
+		ac.namespaceMu.Unlock()
 	}
 }
 

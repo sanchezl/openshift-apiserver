@@ -553,7 +553,73 @@ func TestAuthorizationCacheRace(t *testing.T) {
 	wg.Wait()
 }
 
+func BenchmarkFullCacheInvalidation(b *testing.B) {
+	for _, tc := range []struct {
+		namespaces int
+		users      int
+	}{
+		{namespaces: 100, users: 10},
+		{namespaces: 1000, users: 100},
+	} {
+		b.Run(fmt.Sprintf("ns=%d/users=%d", tc.namespaces, tc.users), func(b *testing.B) {
+			// build expected results: every user has access to every namespace
+			expectedResults := make(map[string]*mockReview, tc.namespaces)
+			users := make([]string, tc.users)
+			for u := 0; u < tc.users; u++ {
+				users[u] = fmt.Sprintf("user-%d", u)
+			}
+			for ns := 0; ns < tc.namespaces; ns++ {
+				expectedResults[fmt.Sprintf("ns-%d", ns)] = &mockReview{
+					users:  users,
+					groups: []string{},
+				}
+			}
+			reviewer := &mockReviewer{expectedResults: expectedResults}
+
+			mockKubeClient := fake.NewSimpleClientset()
+			informers := informers.NewSharedInformerFactory(mockKubeClient, controller.NoResyncPeriodFunc())
+			nsIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			nsLister := corev1listers.NewNamespaceLister(nsIndexer)
+
+			ac := NewAuthorizationCache(
+				nsLister,
+				informers.Core().V1().Namespaces().Informer(),
+				reviewer,
+				informers.Rbac().V1(),
+			)
+
+			for ns := 0; ns < tc.namespaces; ns++ {
+				nsIndexer.Add(&corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            fmt.Sprintf("ns-%d", ns),
+						ResourceVersion: "1",
+					},
+				})
+			}
+
+			// seed the cache
+			ac.synchronize()
+
+			// bump all resource versions to force re-sync every iteration
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				rv := strconv.Itoa(i + 2)
+				for ns := 0; ns < tc.namespaces; ns++ {
+					nsIndexer.Update(&corev1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:            fmt.Sprintf("ns-%d", ns),
+							ResourceVersion: rv,
+						},
+					})
+				}
+				ac.synchronize()
+			}
+		})
+	}
+}
+
 func BenchmarkAddSubjectsToNamespace(b *testing.B) {
+	ac := &AuthorizationCache{}
 	for _, namespaceCount := range []int{10, 100, 1000} {
 		b.Run(fmt.Sprintf("namespaces=%d", namespaceCount), func(b *testing.B) {
 			subjects := []string{"alice", "bob", "eve", "frank", "grace"}
@@ -561,7 +627,7 @@ func BenchmarkAddSubjectsToNamespace(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				store := cache.NewStore(subjectRecordKeyFn)
 				for ns := 0; ns < namespaceCount; ns++ {
-					addSubjectsToNamespace(store, subjects, fmt.Sprintf("namespace-%d", ns))
+					ac.addSubjectsToNamespace(store, subjects, fmt.Sprintf("namespace-%d", ns))
 				}
 			}
 		})
