@@ -38,10 +38,13 @@ type Lister interface {
 	List(user user.Info, selector labels.Selector) (*corev1.NamespaceList, error)
 }
 
-// subjectRecord is a cache record for the set of namespaces a subject can access
+// subjectRecord is a cache record for the set of namespaces a subject can access.
+// namespaces is a sync.Map (keys: string namespace names, values: struct{}{})
+// so that concurrent reads (List) and writes (addSubjectsToNamespace /
+// deleteNamespaceFromSubjects) are safe without copying.
 type subjectRecord struct {
 	subject    string
-	namespaces sets.String
+	namespaces sync.Map
 }
 
 // reviewRequest is the resource we want to review
@@ -505,6 +508,16 @@ func (ac *AuthorizationCache) syncRequest(request *reviewRequest, userSubjectRec
 	return nil
 }
 
+// subjectRecordNamespaces collects all namespace keys from a subjectRecord's sync.Map.
+func subjectRecordNamespaces(sr *subjectRecord) []string {
+	var keys []string
+	sr.namespaces.Range(func(key, _ interface{}) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+	return keys
+}
+
 // List returns the set of namespace names the user has access to view
 func (ac *AuthorizationCache) List(userInfo user.Info, selector labels.Selector) (*corev1.NamespaceList, error) {
 	keys := sets.String{}
@@ -513,15 +526,15 @@ func (ac *AuthorizationCache) List(userInfo user.Info, selector labels.Selector)
 
 	obj, exists, _ := ac.userSubjectRecordStore.GetByKey(user)
 	if exists {
-		subjectRecord := obj.(*subjectRecord)
-		keys.Insert(subjectRecord.namespaces.List()...)
+		sr := obj.(*subjectRecord)
+		keys.Insert(subjectRecordNamespaces(sr)...)
 	}
 
 	for _, group := range groups {
 		obj, exists, _ := ac.groupSubjectRecordStore.GetByKey(group)
 		if exists {
-			subjectRecord := obj.(*subjectRecord)
-			keys.Insert(subjectRecord.namespaces.List()...)
+			sr := obj.(*subjectRecord)
+			keys.Insert(subjectRecordNamespaces(sr)...)
 		}
 	}
 
@@ -594,16 +607,21 @@ func skipReview(request *reviewRequest, lastKnownValue *reviewRecord) bool {
 	return true
 }
 
-// deleteNamespaceFromSubjects removes the namespace from each subject
-// if no other namespaces are active to that subject, it will also delete the subject from the cache entirely
+// deleteNamespaceFromSubjects removes the namespace from each subject.
+// If no other namespaces remain for that subject, it removes the subject from the store entirely.
 func deleteNamespaceFromSubjects(subjectRecordStore cache.Store, subjects []string, namespace string) {
 	for _, subject := range subjects {
 		obj, exists, _ := subjectRecordStore.GetByKey(subject)
 		if exists {
-			subjectRecord := obj.(*subjectRecord)
-			delete(subjectRecord.namespaces, namespace)
-			if len(subjectRecord.namespaces) == 0 {
-				subjectRecordStore.Delete(subjectRecord)
+			sr := obj.(*subjectRecord)
+			sr.namespaces.Delete(namespace)
+			empty := true
+			sr.namespaces.Range(func(_, _ interface{}) bool {
+				empty = false
+				return false
+			})
+			if empty {
+				subjectRecordStore.Delete(sr)
 			}
 		}
 	}
@@ -617,10 +635,10 @@ func addSubjectsToNamespace(subjectRecordStore cache.Store, subjects []string, n
 		if exists {
 			item = obj.(*subjectRecord)
 		} else {
-			item = &subjectRecord{subject: subject, namespaces: sets.NewString()}
+			item = &subjectRecord{subject: subject}
 			subjectRecordStore.Add(item)
 		}
-		item.namespaces.Insert(namespace)
+		item.namespaces.Store(namespace, struct{}{})
 	}
 }
 
